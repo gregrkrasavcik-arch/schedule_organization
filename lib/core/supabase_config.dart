@@ -1,0 +1,3 @@
+// Основные параметры для Supabase
+const String supabaseUrl = 'https://urfsfmgkoercwrvnnnww.supabase.co';
+const String supabaseAnonKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVyZnNmbWdrb2VyY3dydm5ubnd3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjM5NzczNTcsImV4cCI6MjA3OTU1MzM1N30.vxvwmcoHYNxsWu53LZEDD6jbGCONZNTnXOy1ugBYlr8';
