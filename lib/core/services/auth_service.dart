@@ -1,34 +1,100 @@
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 class AuthService {
-  final SupabaseClient client;
+  final SupabaseClient _supabase = Supabase.instance.client;
 
-  AuthService(this.client);
+  // Регистрация
+  Future<AuthResponse> signUp({
+    required String email,
+    required String password,
+    required String fullName,
+    required String role,
+  }) async {
+    try {
+      final response = await _supabase.auth.signUp(
+        email: email,
+        password: password,
+        data: {'full_name': fullName, 'role': role},
+      );
 
-  Future<AuthResponse> signIn(String email, String password) {
-    return client.auth.signInWithPassword(email: email, password: password);
-  }
+      // Создаём профиль в таблице profiles
+      if (response.user != null) {
+        await _supabase.from('profiles').insert({
+          'id': response.user!.id,
+          'full_name': fullName,
+          'role': role,
+        });
+      }
 
-  Future<AuthResponse> signUp(
-    String email,
-    String password,
-    String fullName,
-  ) async {
-    final res = await client.auth.signUp(email: email, password: password);
-
-    final user = res.user; // важная строчка
-    if (user != null) {
-      await client.from('profiles').insert({
-        'id': user.id,
-        'full_name': fullName,
-        'role': 'student',
-      });
+      return response;
+    } catch (e) {
+      rethrow;
     }
-
-    return res;
   }
 
-  Future<void> signOut() => client.auth.signOut();
+  // Вход
+  Future<AuthResponse> signIn({
+    required String email,
+    required String password,
+  }) async {
+    try {
+      return await _supabase.auth.signInWithPassword(
+        email: email,
+        password: password,
+      );
+    } catch (e) {
+      rethrow;
+    }
+  }
 
-  Session? get currentSession => client.auth.currentSession;
+  // Выход
+  Future<void> signOut() async {
+    await _supabase.auth.signOut();
+  }
+
+  // Получить роль текущего пользователя
+  Future<String?> getCurrentUserRole() async {
+    try {
+      final user = _supabase.auth.currentUser;
+      if (user == null) return null;
+
+      final profile = await _supabase
+          .from('profiles')
+          .select('role')
+          .eq('id', user.id)
+          .single();
+
+      return profile['role'] as String?;
+    } catch (e) {
+      print('Error getting user role: $e');
+      return null;
+    }
+  }
+
+  // Получить полный профиль
+  Future<Map<String, dynamic>?> getCurrentUserProfile() async {
+    try {
+      final user = _supabase.auth.currentUser;
+      if (user == null) return null;
+
+      final profile = await _supabase
+          .from('profiles')
+          .select()
+          .eq('id', user.id)
+          .single();
+
+      return profile as Map<String, dynamic>;
+    } catch (e) {
+      print('Error getting user profile: $e');
+      return null;
+    }
+  }
+
+  // Stream для отслеживания изменений состояния авторизации
+  Stream<AuthState> get authStateChanges => _supabase.auth.onAuthStateChange;
+
+  // Получить текущего пользователя
+  User? getCurrentUser() {
+    return _supabase.auth.currentUser;
+  }
 }

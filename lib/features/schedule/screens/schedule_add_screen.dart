@@ -5,7 +5,15 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../../../core/models/schedule_model.dart';
 import '../../../core/models/time_slot_model.dart';
+import '../../../core/models/group_model.dart';
+import '../../../core/models/teacher_model.dart';
+import '../../../core/models/discipline_model.dart';
 import '../../../core/services/time_slot_service.dart';
+import '../../../core/services/group_service.dart';
+import '../../../core/services/teacher_service.dart';
+import '../../../core/services/group_semester_service.dart';
+import '../../../core/services/semester_discipline_service.dart';
+import '../../../core/services/schedule_conflict_service.dart';
 
 class ScheduleAddScreen extends StatefulWidget {
   final Map<String, dynamic>? initialData;
@@ -25,17 +33,30 @@ class _ScheduleAddScreenState extends State<ScheduleAddScreen> {
   late TextEditingController _startTimeCtrl;
   late TextEditingController _endTimeCtrl;
 
-  int _weekday = 1; // 1–7, вычисляется по дате
-  int _slotNumber = 1; // номер пары
-  int _loadScore = 1; // 1–5
+  int _weekday = 1;
+  int _slotNumber = 1;
+  int _loadScore = 1;
   DateTime? _date;
   String? _selectedColorHex;
+  int? _selectedGroupId;
+  int? _selectedTeacherId;
+  int? _selectedDisciplineId;
 
   bool _isSaving = false;
   bool _slotsLoading = false;
+  bool _dataLoading = true;
+
   List<TimeSlotModel> _slotsForDay = [];
+  List<GroupModel> _groups = [];
+  List<TeacherModel> _teachers = [];
+  List<DisciplineModel> _availableDisciplines = [];
 
   late final TimeSlotService _slotService;
+  late final GroupService _groupService;
+  late final TeacherService _teacherService;
+  late final GroupSemesterService _groupSemesterService;
+  late final SemesterDisciplineService _semesterDisciplineService;
+  late final ScheduleConflictService _conflictService;
 
   final _dayNames = const [
     '',
@@ -60,6 +81,13 @@ class _ScheduleAddScreenState extends State<ScheduleAddScreen> {
   void initState() {
     super.initState();
     _slotService = TimeSlotService(Supabase.instance.client);
+    _groupService = GroupService(Supabase.instance.client);
+    _teacherService = TeacherService(Supabase.instance.client);
+    _groupSemesterService = GroupSemesterService(Supabase.instance.client);
+    _semesterDisciplineService = SemesterDisciplineService(
+      Supabase.instance.client,
+    );
+    _conflictService = ScheduleConflictService(Supabase.instance.client);
 
     final data = widget.initialData;
     _lessonCtrl = TextEditingController(text: data?['lesson_name'] ?? '');
@@ -76,6 +104,8 @@ class _ScheduleAddScreenState extends State<ScheduleAddScreen> {
     _slotNumber = int.tryParse(data?['slot_number']?.toString() ?? '1') ?? 1;
     _loadScore = int.tryParse(data?['load_score']?.toString() ?? '1') ?? 1;
     _selectedColorHex = data?['subject_color'] as String?;
+    _selectedGroupId = data?['group_id'] as int?;
+    _selectedTeacherId = data?['teacher_id'] as int?;
 
     if (data?['date'] != null && data!['date'].toString().isNotEmpty) {
       _date = DateTime.tryParse(data['date'].toString());
@@ -84,7 +114,61 @@ class _ScheduleAddScreenState extends State<ScheduleAddScreen> {
       }
     }
 
-    _loadSlotsForDay(_weekday);
+    _loadInitialData();
+  }
+
+  Future<void> _loadInitialData() async {
+    try {
+      final groups = await _groupService.fetchAll();
+      final teachers = await _teacherService.fetchAll();
+      setState(() {
+        _groups = groups;
+        _teachers = teachers;
+        _dataLoading = false;
+      });
+      await _loadSlotsForDay(_weekday);
+      if (_selectedGroupId != null) {
+        await _loadDisciplinesForGroup();
+      }
+    } catch (e) {
+      setState(() => _dataLoading = false);
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Ошибка загрузки данных: $e')));
+    }
+  }
+
+  Future<void> _loadDisciplinesForGroup() async {
+    if (_selectedGroupId == null) {
+      setState(() => _availableDisciplines = []);
+      return;
+    }
+
+    try {
+      final semester = await _groupSemesterService.fetchCurrentSemesterForGroup(
+        _selectedGroupId!,
+      );
+
+      if (semester == null) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Группа не назначена на семестр')),
+        );
+        setState(() => _availableDisciplines = []);
+        return;
+      }
+
+      final disciplines = await _semesterDisciplineService
+          .fetchForGroupInSemester(_selectedGroupId!, semester.id);
+
+      setState(() => _availableDisciplines = disciplines);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Ошибка загрузки дисциплин: $e')));
+    }
   }
 
   int? _parseWeekday(dynamic value) {
@@ -130,7 +214,7 @@ class _ScheduleAddScreenState extends State<ScheduleAddScreen> {
     if (picked != null) {
       setState(() {
         _date = picked;
-        _weekday = picked.weekday; // авто день недели
+        _weekday = picked.weekday;
       });
       await _loadSlotsForDay(_weekday);
     }
@@ -147,7 +231,7 @@ class _ScheduleAddScreenState extends State<ScheduleAddScreen> {
         .map((e) => int.tryParse(e['load_score']?.toString() ?? '0') ?? 0)
         .fold<int>(0, (sum, v) => sum + v);
 
-    const maxLoadPerDayGost = 10; // временный лимит
+    const maxLoadPerDayGost = 10;
     return existingSum + newLoadScore <= maxLoadPerDayGost;
   }
 
@@ -162,54 +246,112 @@ class _ScheduleAddScreenState extends State<ScheduleAddScreen> {
 
     setState(() => _isSaving = true);
 
-    final ok = await _checkDailyLoad(_weekday, _loadScore);
-    if (!ok) {
-      setState(() => _isSaving = false);
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text(
-            'Слишком большая нагрузка на этот день (ограничение по ГОСТ)',
-          ),
-        ),
-      );
-      return false;
-    }
-
-    final payload = {
-      'lesson_name': _lessonCtrl.text.trim(),
-      'teacher': _teacherCtrl.text.trim(),
-      'classroom': _classroomCtrl.text.trim(),
-      'weekday': _weekday,
-      'slot_number': _slotNumber,
-      'start_time': '${_startTimeCtrl.text.trim()}:00',
-      'end_time': '${_endTimeCtrl.text.trim()}:00',
-      'date': _date?.toIso8601String(),
-      'load_score': _loadScore,
-      'subject_color': _selectedColorHex,
-    };
-
-    final client = Supabase.instance.client;
     try {
-      if (widget.initialData != null && widget.initialData!['id'] != null) {
-        await client
-            .from('schedule')
-            .update(payload)
-            .eq('id', widget.initialData!['id']);
-      } else {
-        await client.from('schedule').insert(payload);
+      // Проверка нагрузки по ГОСТ
+      final ok = await _checkDailyLoad(_weekday, _loadScore);
+      if (!ok) {
+        setState(() => _isSaving = false);
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Слишком большая нагрузка на этот день (ограничение по ГОСТ)',
+            ),
+          ),
+        );
+        return false;
       }
 
-      if (closeAfterSave && mounted) Navigator.pop(context, true);
-      return true;
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('Ошибка сохранения: $e')));
+      // Проверка конфликтов
+      final conflicts = await _conflictService.checkAllConflicts(
+        groupId: _selectedGroupId,
+        teacherId: _selectedTeacherId,
+        classroom: _classroomCtrl.text.trim(),
+        startTime: '${_startTimeCtrl.text.trim()}:00',
+        endTime: '${_endTimeCtrl.text.trim()}:00',
+        weekday: _weekday,
+        date: _date?.toIso8601String(),
+        excludeScheduleId: widget.initialData != null
+            ? widget.initialData!['id']
+            : null,
+      );
+
+      if (conflicts.isNotEmpty) {
+        setState(() => _isSaving = false);
+        if (!mounted) return false;
+
+        final conflictText = conflicts
+            .map((c) => '⚠️ ${c.message}')
+            .join('\n\n');
+
+        final proceed =
+            await showDialog<bool>(
+              context: context,
+              builder: (_) => AlertDialog(
+                title: const Text('🔴 Обнаружены конфликты'),
+                content: SingleChildScrollView(child: Text(conflictText)),
+                actions: [
+                  TextButton(
+                    onPressed: () => Navigator.pop(context, false),
+                    child: const Text('Отмена'),
+                  ),
+                  TextButton(
+                    onPressed: () => Navigator.pop(context, true),
+                    child: const Text('Добавить всё равно'),
+                  ),
+                ],
+              ),
+            ) ??
+            false;
+
+        if (!proceed) return false;
+        setState(() => _isSaving = true);
       }
+
+      final payload = {
+        'lesson_name': _lessonCtrl.text.trim(),
+        'teacher': _teacherCtrl.text.trim(),
+        'classroom': _classroomCtrl.text.trim(),
+        'weekday': _weekday,
+        'slot_number': _slotNumber,
+        'start_time': '${_startTimeCtrl.text.trim()}:00',
+        'end_time': '${_endTimeCtrl.text.trim()}:00',
+        'date': _date?.toIso8601String(),
+        'load_score': _loadScore,
+        'subject_color': _selectedColorHex,
+        'group_id': _selectedGroupId,
+        'teacher_id': _selectedTeacherId,
+      };
+
+      final client = Supabase.instance.client;
+      try {
+        if (widget.initialData != null && widget.initialData!['id'] != null) {
+          await client
+              .from('schedule')
+              .update(payload)
+              .eq('id', widget.initialData!['id']);
+        } else {
+          await client.from('schedule').insert(payload);
+        }
+
+        if (closeAfterSave && mounted) Navigator.pop(context, true);
+        return true;
+      } catch (e) {
+        if (mounted) {
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(SnackBar(content: Text('Ошибка сохранения: $e')));
+        }
+        return false;
+      } finally {
+        if (mounted) setState(() => _isSaving = false);
+      }
+    } catch (e) {
+      setState(() => _isSaving = false);
+      if (!mounted) return false;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Ошибка проверки конфликтов: $e')));
       return false;
-    } finally {
-      if (mounted) setState(() => _isSaving = false);
     }
   }
 
@@ -226,12 +368,14 @@ class _ScheduleAddScreenState extends State<ScheduleAddScreen> {
       _classroomCtrl.clear();
       _startTimeCtrl.clear();
       _endTimeCtrl.clear();
-      // дата, день недели, слот, цвет остаются
+      _selectedDisciplineId = null;
     });
 
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Пара добавлена, можно ввести следующую')),
+        const SnackBar(
+          content: Text('✅ Пара добавлена, можно ввести следующую'),
+        ),
       );
     }
   }
@@ -249,260 +393,419 @@ class _ScheduleAddScreenState extends State<ScheduleAddScreen> {
         ),
         centerTitle: true,
       ),
-      body: SafeArea(
-        child: Container(
-          decoration: BoxDecoration(
-            gradient: LinearGradient(
-              colors: [Colors.blueGrey.shade900, Colors.indigo.shade700],
-              begin: Alignment.topLeft,
-              end: Alignment.bottomRight,
-            ),
-          ),
-          child: Center(
-            child: SingleChildScrollView(
-              padding: const EdgeInsets.all(16),
-              child: ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 520),
-                child: _GlassContainer(
-                  child: Padding(
-                    padding: const EdgeInsets.all(18),
-                    child: Form(
-                      key: _formKey,
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          TextFormField(
-                            controller: _lessonCtrl,
-                            decoration: const InputDecoration(
-                              labelText: 'Название предмета',
-                            ),
-                            validator: (v) => v == null || v.trim().isEmpty
-                                ? 'Введите предмет'
-                                : null,
-                          ),
-                          const SizedBox(height: 12),
-                          TextFormField(
-                            controller: _teacherCtrl,
-                            decoration: const InputDecoration(
-                              labelText: 'Преподаватель',
-                            ),
-                          ),
-                          const SizedBox(height: 12),
-                          TextFormField(
-                            controller: _classroomCtrl,
-                            decoration: const InputDecoration(
-                              labelText: 'Аудитория',
-                            ),
-                          ),
-                          const SizedBox(height: 16),
-                          Row(
-                            children: [
-                              Expanded(
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
+      body: _dataLoading
+          ? const Center(child: CircularProgressIndicator())
+          : SafeArea(
+              child: Container(
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    colors: [Colors.blueGrey.shade900, Colors.indigo.shade700],
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                  ),
+                ),
+                child: Center(
+                  child: SingleChildScrollView(
+                    padding: const EdgeInsets.all(16),
+                    child: ConstrainedBox(
+                      constraints: const BoxConstraints(maxWidth: 520),
+                      child: _GlassContainer(
+                        child: Padding(
+                          padding: const EdgeInsets.all(18),
+                          child: Form(
+                            key: _formKey,
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                // Название предмета
+                                TextFormField(
+                                  controller: _lessonCtrl,
+                                  decoration: const InputDecoration(
+                                    labelText: 'Название предмета',
+                                    prefixIcon: Icon(Icons.book),
+                                  ),
+                                  validator: (v) =>
+                                      v == null || v.trim().isEmpty
+                                      ? 'Введите предмет'
+                                      : null,
+                                ),
+                                const SizedBox(height: 12),
+
+                                // Группа
+                                DropdownButtonFormField<int?>(
+                                  value: _selectedGroupId,
+                                  decoration: const InputDecoration(
+                                    labelText: 'Группа',
+                                    prefixIcon: Icon(Icons.people),
+                                  ),
+                                  items: [
+                                    const DropdownMenuItem<int?>(
+                                      value: null,
+                                      child: Text('Без группы'),
+                                    ),
+                                    ..._groups.map(
+                                      (g) => DropdownMenuItem<int?>(
+                                        value: g.id,
+                                        child: Text(g.name),
+                                      ),
+                                    ),
+                                  ],
+                                  onChanged: (val) async {
+                                    setState(() => _selectedGroupId = val);
+                                    if (val != null) {
+                                      await _loadDisciplinesForGroup();
+                                    }
+                                  },
+                                ),
+                                const SizedBox(height: 12),
+
+                                // Дисциплина (если есть дисциплины группы)
+                                if (_availableDisciplines.isNotEmpty)
+                                  DropdownButtonFormField<int?>(
+                                    value: _selectedDisciplineId,
+                                    decoration: const InputDecoration(
+                                      labelText: 'Дисциплина группы',
+                                      prefixIcon: Icon(Icons.bookmark),
+                                    ),
+                                    items: [
+                                      const DropdownMenuItem<int?>(
+                                        value: null,
+                                        child: Text('Выбрать дисциплину'),
+                                      ),
+                                      ..._availableDisciplines.map(
+                                        (d) => DropdownMenuItem<int?>(
+                                          value: d.id,
+                                          child: Text(d.name),
+                                        ),
+                                      ),
+                                    ],
+                                    onChanged: (val) {
+                                      setState(
+                                        () => _selectedDisciplineId = val,
+                                      );
+                                      if (val != null) {
+                                        final discipline = _availableDisciplines
+                                            .firstWhere((d) => d.id == val);
+                                        _lessonCtrl.text = discipline.name;
+                                      }
+                                    },
+                                  ),
+                                const SizedBox(height: 12),
+
+                                // Преподаватель из списка
+                                DropdownButtonFormField<int?>(
+                                  value: _selectedTeacherId,
+                                  decoration: const InputDecoration(
+                                    labelText: 'Преподаватель',
+                                    prefixIcon: Icon(Icons.school),
+                                  ),
+                                  items: [
+                                    const DropdownMenuItem<int?>(
+                                      value: null,
+                                      child: Text('Выбрать преподавателя'),
+                                    ),
+                                    ..._teachers.map(
+                                      (t) => DropdownMenuItem<int?>(
+                                        value: t.id,
+                                        child: Text(t.fullName),
+                                      ),
+                                    ),
+                                  ],
+                                  onChanged: (val) {
+                                    setState(() => _selectedTeacherId = val);
+                                    if (val != null) {
+                                      final teacher = _teachers.firstWhere(
+                                        (t) => t.id == val,
+                                      );
+                                      _teacherCtrl.text = teacher.fullName;
+                                    }
+                                  },
+                                ),
+                                const SizedBox(height: 12),
+
+                                // ФИО преподавателя (если не из списка)
+                                TextFormField(
+                                  controller: _teacherCtrl,
+                                  decoration: const InputDecoration(
+                                    labelText: 'ФИО преподавателя',
+                                    prefixIcon: Icon(Icons.person),
+                                  ),
+                                ),
+                                const SizedBox(height: 12),
+
+                                // Аудитория
+                                TextFormField(
+                                  controller: _classroomCtrl,
+                                  decoration: const InputDecoration(
+                                    labelText: 'Аудитория',
+                                    prefixIcon: Icon(Icons.location_on),
+                                  ),
+                                ),
+                                const SizedBox(height: 16),
+
+                                // Дата
+                                Row(
                                   children: [
-                                    const Text(
-                                      'Дата занятия',
-                                      style: TextStyle(
-                                        fontSize: 13,
-                                        color: Colors.white70,
+                                    Expanded(
+                                      child: Column(
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.start,
+                                        children: [
+                                          const Text(
+                                            'Дата занятия',
+                                            style: TextStyle(
+                                              fontSize: 13,
+                                              color: Colors.white70,
+                                            ),
+                                          ),
+                                          const SizedBox(height: 4),
+                                          Text(
+                                            dateText,
+                                            style: const TextStyle(
+                                              fontSize: 15,
+                                              fontWeight: FontWeight.w500,
+                                              color: Colors.white,
+                                            ),
+                                          ),
+                                          const SizedBox(height: 2),
+                                          Text(
+                                            _dayNames[_weekday],
+                                            style: const TextStyle(
+                                              fontSize: 13,
+                                              color: Colors.white60,
+                                            ),
+                                          ),
+                                        ],
                                       ),
                                     ),
-                                    const SizedBox(height: 4),
-                                    Text(
-                                      dateText,
-                                      style: const TextStyle(
-                                        fontSize: 15,
-                                        fontWeight: FontWeight.w500,
-                                        color: Colors.white,
+                                    TextButton(
+                                      onPressed: _pickDate,
+                                      child: const Text('Выбрать'),
+                                    ),
+                                  ],
+                                ),
+                                const SizedBox(height: 12),
+
+                                // Номер пары
+                                _slotsLoading
+                                    ? const LinearProgressIndicator()
+                                    : DropdownButtonFormField<int>(
+                                        decoration: const InputDecoration(
+                                          labelText: 'Номер пары',
+                                          prefixIcon: Icon(Icons.schedule),
+                                        ),
+                                        value: _slotNumber,
+                                        onChanged: (val) {
+                                          setState(
+                                            () => _slotNumber = val ?? 1,
+                                          );
+
+                                          TimeSlotModel? slot;
+                                          for (final s in _slotsForDay) {
+                                            if (s.slotNumber == _slotNumber) {
+                                              slot = s;
+                                              break;
+                                            }
+                                          }
+                                          if (slot != null) {
+                                            _startTimeCtrl.text = slot.startTime
+                                                .substring(0, 5);
+                                            _endTimeCtrl.text = slot.endTime
+                                                .substring(0, 5);
+                                          }
+                                        },
+                                        items: (() {
+                                          final baseNumbers =
+                                              _slotsForDay.isEmpty
+                                              ? List.generate(6, (i) => i + 1)
+                                              : _slotsForDay
+                                                    .map((s) => s.slotNumber)
+                                                    .toList();
+                                          final unique =
+                                              baseNumbers.toSet().toList()
+                                                ..sort();
+                                          return unique
+                                              .map(
+                                                (n) => DropdownMenuItem(
+                                                  value: n,
+                                                  child: Text('$n‑я пара'),
+                                                ),
+                                              )
+                                              .toList();
+                                        })(),
+                                      ),
+                                const SizedBox(height: 12),
+
+                                // Время
+                                Row(
+                                  children: [
+                                    Expanded(
+                                      child: TextFormField(
+                                        controller: _startTimeCtrl,
+                                        decoration: const InputDecoration(
+                                          labelText: 'Начало (HH:MM)',
+                                          prefixIcon: Icon(Icons.schedule),
+                                        ),
+                                        validator: (v) =>
+                                            v == null || v.trim().isEmpty
+                                            ? 'Введите время'
+                                            : null,
                                       ),
                                     ),
-                                    const SizedBox(height: 2),
-                                    Text(
-                                      _dayNames[_weekday],
-                                      style: const TextStyle(
-                                        fontSize: 13,
-                                        color: Colors.white60,
+                                    const SizedBox(width: 8),
+                                    Expanded(
+                                      child: TextFormField(
+                                        controller: _endTimeCtrl,
+                                        decoration: const InputDecoration(
+                                          labelText: 'Конец (HH:MM)',
+                                          prefixIcon: Icon(Icons.schedule),
+                                        ),
+                                        validator: (v) =>
+                                            v == null || v.trim().isEmpty
+                                            ? 'Введите время'
+                                            : null,
                                       ),
                                     ),
                                   ],
                                 ),
-                              ),
-                              TextButton(
-                                onPressed: _pickDate,
-                                child: const Text('Выбрать'),
-                              ),
-                            ],
-                          ),
-                          const SizedBox(height: 12),
-                          _slotsLoading
-                              ? const LinearProgressIndicator()
-                              : DropdownButtonFormField<int>(
-                                  decoration: const InputDecoration(
-                                    labelText: 'Номер пары',
-                                  ),
-                                  value: _slotNumber,
-                                  onChanged: (val) {
-                                    setState(() => _slotNumber = val ?? 1);
+                                const SizedBox(height: 16),
 
-                                    TimeSlotModel? slot;
-                                    for (final s in _slotsForDay) {
-                                      if (s.slotNumber == _slotNumber) {
-                                        slot = s;
-                                        break;
-                                      }
-                                    }
-                                    if (slot != null) {
-                                      _startTimeCtrl.text = slot.startTime
-                                          .substring(0, 5);
-                                      _endTimeCtrl.text = slot.endTime
-                                          .substring(0, 5);
-                                    }
-                                  },
-                                  items: (() {
-                                    final baseNumbers = _slotsForDay.isEmpty
-                                        ? List.generate(6, (i) => i + 1)
-                                        : _slotsForDay
-                                              .map((s) => s.slotNumber)
-                                              .toList();
-                                    final unique = baseNumbers.toSet().toList()
-                                      ..sort();
-                                    return unique
-                                        .map(
-                                          (n) => DropdownMenuItem(
-                                            value: n,
-                                            child: Text('$n‑я пара'),
-                                          ),
-                                        )
-                                        .toList();
-                                  })(),
+                                // Нагрузка
+                                Row(
+                                  mainAxisAlignment:
+                                      MainAxisAlignment.spaceBetween,
+                                  children: [
+                                    const Text(
+                                      'Нагрузка (1–5)',
+                                      style: TextStyle(color: Colors.white70),
+                                    ),
+                                    Container(
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 12,
+                                        vertical: 4,
+                                      ),
+                                      decoration: BoxDecoration(
+                                        color: Colors.white.withOpacity(0.2),
+                                        borderRadius: BorderRadius.circular(12),
+                                      ),
+                                      child: Text(
+                                        _loadScore.toString(),
+                                        style: const TextStyle(
+                                          color: Colors.white,
+                                          fontWeight: FontWeight.bold,
+                                          fontSize: 18,
+                                        ),
+                                      ),
+                                    ),
+                                  ],
                                 ),
-                          const SizedBox(height: 12),
-                          Row(
-                            children: [
-                              Expanded(
-                                child: TextFormField(
-                                  controller: _startTimeCtrl,
-                                  decoration: const InputDecoration(
-                                    labelText: 'Начало (HH:MM)',
+                                Slider(
+                                  value: _loadScore.toDouble(),
+                                  min: 1,
+                                  max: 5,
+                                  divisions: 4,
+                                  label: _loadScore.toString(),
+                                  onChanged: (val) =>
+                                      setState(() => _loadScore = val.round()),
+                                ),
+                                const SizedBox(height: 12),
+
+                                // Цвет предмета
+                                Align(
+                                  alignment: Alignment.centerLeft,
+                                  child: Text(
+                                    'Цвет предмета',
+                                    style: Theme.of(context)
+                                        .textTheme
+                                        .bodyMedium
+                                        ?.copyWith(color: Colors.white70),
                                   ),
-                                  validator: (v) =>
-                                      v == null || v.trim().isEmpty
-                                      ? 'Введите время'
-                                      : null,
                                 ),
-                              ),
-                              const SizedBox(width: 8),
-                              Expanded(
-                                child: TextFormField(
-                                  controller: _endTimeCtrl,
-                                  decoration: const InputDecoration(
-                                    labelText: 'Конец (HH:MM)',
-                                  ),
-                                  validator: (v) =>
-                                      v == null || v.trim().isEmpty
-                                      ? 'Введите время'
-                                      : null,
+                                const SizedBox(height: 8),
+                                Wrap(
+                                  spacing: 8,
+                                  children: _availableColors.map((hex) {
+                                    final color = parseHexColor(hex);
+                                    final isSelected = _selectedColorHex == hex;
+                                    return GestureDetector(
+                                      onTap: () => setState(
+                                        () => _selectedColorHex = hex,
+                                      ),
+                                      child: Container(
+                                        width: 40,
+                                        height: 40,
+                                        decoration: BoxDecoration(
+                                          color: color,
+                                          shape: BoxShape.circle,
+                                          border: isSelected
+                                              ? Border.all(
+                                                  color: Colors.white,
+                                                  width: 3,
+                                                )
+                                              : Border.all(
+                                                  color: Colors.white30,
+                                                  width: 1,
+                                                ),
+                                          boxShadow: isSelected
+                                              ? [
+                                                  BoxShadow(
+                                                    color: color.withOpacity(
+                                                      0.5,
+                                                    ),
+                                                    blurRadius: 8,
+                                                  ),
+                                                ]
+                                              : null,
+                                        ),
+                                      ),
+                                    );
+                                  }).toList(),
                                 ),
-                              ),
-                            ],
-                          ),
-                          const SizedBox(height: 16),
-                          Row(
-                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                            children: [
-                              const Text(
-                                'Нагрузка (1–5)',
-                                style: TextStyle(color: Colors.white70),
-                              ),
-                              Text(
-                                _loadScore.toString(),
-                                style: const TextStyle(color: Colors.white),
-                              ),
-                            ],
-                          ),
-                          Slider(
-                            value: _loadScore.toDouble(),
-                            min: 1,
-                            max: 5,
-                            divisions: 4,
-                            label: _loadScore.toString(),
-                            onChanged: (val) =>
-                                setState(() => _loadScore = val.round()),
-                          ),
-                          const SizedBox(height: 12),
-                          Align(
-                            alignment: Alignment.centerLeft,
-                            child: Text(
-                              'Цвет предмета',
-                              style: Theme.of(context).textTheme.bodyMedium
-                                  ?.copyWith(color: Colors.white70),
+                                const SizedBox(height: 24),
+
+                                // Кнопки сохранения
+                                Row(
+                                  children: [
+                                    Expanded(
+                                      child: ElevatedButton.icon(
+                                        onPressed: _isSaving
+                                            ? null
+                                            : _saveAndClose,
+                                        icon: _isSaving
+                                            ? const SizedBox(
+                                                height: 20,
+                                                width: 20,
+                                                child:
+                                                    CircularProgressIndicator(
+                                                      strokeWidth: 2,
+                                                    ),
+                                              )
+                                            : const Icon(Icons.check),
+                                        label: const Text('Сохранить и выйти'),
+                                      ),
+                                    ),
+                                    const SizedBox(width: 12),
+                                    Expanded(
+                                      child: OutlinedButton.icon(
+                                        onPressed: _isSaving
+                                            ? null
+                                            : _saveAndAddAnother,
+                                        icon: const Icon(Icons.add),
+                                        label: const Text('Ещё пара'),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ],
                             ),
                           ),
-                          const SizedBox(height: 8),
-                          Wrap(
-                            spacing: 8,
-                            children: _availableColors.map((hex) {
-                              final color = parseHexColor(hex);
-                              final isSelected = _selectedColorHex == hex;
-                              return GestureDetector(
-                                onTap: () =>
-                                    setState(() => _selectedColorHex = hex),
-                                child: Container(
-                                  width: 28,
-                                  height: 28,
-                                  decoration: BoxDecoration(
-                                    color: color,
-                                    shape: BoxShape.circle,
-                                    border: isSelected
-                                        ? Border.all(
-                                            color: Colors.white,
-                                            width: 3,
-                                          )
-                                        : null,
-                                  ),
-                                ),
-                              );
-                            }).toList(),
-                          ),
-                          const SizedBox(height: 24),
-                          Row(
-                            children: [
-                              Expanded(
-                                child: ElevatedButton(
-                                  onPressed: _isSaving ? null : _saveAndClose,
-                                  child: _isSaving
-                                      ? const SizedBox(
-                                          height: 20,
-                                          width: 20,
-                                          child: CircularProgressIndicator(
-                                            strokeWidth: 2,
-                                          ),
-                                        )
-                                      : const Text('Сохранить и выйти'),
-                                ),
-                              ),
-                              const SizedBox(width: 12),
-                              Expanded(
-                                child: OutlinedButton(
-                                  onPressed: _isSaving
-                                      ? null
-                                      : _saveAndAddAnother,
-                                  child: const Text('Добавить ещё пару'),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ],
+                        ),
                       ),
                     ),
                   ),
                 ),
               ),
             ),
-          ),
-        ),
-      ),
     );
   }
 }

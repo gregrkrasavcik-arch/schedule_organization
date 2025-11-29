@@ -6,6 +6,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../../../core/models/schedule_model.dart';
 import '../../../core/services/profile_service.dart';
+import '../../admin/screens/admin_screen.dart';
 import '../../auth/screens/profile_screen.dart';
 import 'schedule_add_screen.dart';
 import 'time_slots_screen.dart';
@@ -165,6 +166,16 @@ class _ScheduleListScreenState extends State<ScheduleListScreen> {
         backgroundColor: Colors.transparent,
         actions: [
           if (_role == 'admin') ...[
+            IconButton(
+              tooltip: 'Администратор',
+              icon: const Icon(Icons.admin_panel_settings),
+              onPressed: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (_) => const AdminScreen()),
+                );
+              },
+            ),
             IconButton(
               tooltip: 'Слоты',
               icon: const Icon(Icons.access_time),
